@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import (
-    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
 )
@@ -63,6 +63,61 @@ SAVE_EVERY_N_STEPS = 500
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class RewardModel(nn.Module):
+    """Custom reward model that adds a regression head to a causal LM."""
+    
+    def __init__(self, base_model_path, device="cuda"):
+        super().__init__()
+        # Load the SFT model as base
+        model_kwargs = {"trust_remote_code": True}
+        
+        if device == "cuda":
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            model_kwargs["quantization_config"] = bnb_config
+            model_kwargs["device_map"] = "auto"
+        
+        self.base_model = AutoModelForCausalLM.from_pretrained(base_model_path, **model_kwargs)
+        
+        # Add reward head
+        hidden_size = self.base_model.config.hidden_size
+        self.reward_head = nn.Linear(hidden_size, 1)
+        
+        # Initialize reward head
+        nn.init.zeros_(self.reward_head.weight)
+        nn.init.zeros_(self.reward_head.bias)
+        
+        if device == "cpu":
+            self.to(device)
+    
+    def forward(self, input_ids, attention_mask=None):
+        # Get base model outputs
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        
+        # Get last hidden state
+        last_hidden_state = outputs.hidden_states[-1]
+        
+        # Use last non-padded token for each sequence
+        if attention_mask is not None:
+            sequence_lengths = attention_mask.sum(dim=1) - 1
+            batch_size = last_hidden_state.shape[0]
+            last_token_hidden = last_hidden_state[range(batch_size), sequence_lengths]
+        else:
+            last_token_hidden = last_hidden_state[:, -1]
+        
+        # Apply reward head
+        reward = self.reward_head(last_token_hidden)
+        
+        # Return in format expected by training loop
+        return type('RewardOutput', (), {'logits': reward})()
+
 def setup_wandb():
     """Initialize wandb for reward model training."""
     if not USE_WANDB:
@@ -92,32 +147,16 @@ def setup_reward_model():
     
     if USE_SFT_MODEL and os.path.exists(SFT_MODEL_PATH):
         logger.info(f"Loading SFT model from: {SFT_MODEL_PATH}")
-        model_name = SFT_MODEL_PATH
+        model = RewardModel(SFT_MODEL_PATH, device)
         tokenizer = AutoTokenizer.from_pretrained(SFT_MODEL_PATH)
     else:
         logger.info(f"Loading base model: {BASE_MODEL_NAME}")
-        model_name = BASE_MODEL_NAME
+        model = RewardModel(BASE_MODEL_NAME, device)
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, trust_remote_code=True)
     
-    # Load model for sequence classification (reward scoring)
-    model_kwargs = {"num_labels": 1, "trust_remote_code": True}
-    
-    if device == "cuda":
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        model_kwargs["quantization_config"] = bnb_config
-        model_kwargs["device_map"] = "auto"
-    
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, **model_kwargs)
-    
     tokenizer.pad_token = tokenizer.eos_token
-    model.config.pad_token_id = tokenizer.pad_token_id
-    
-    if device == "cpu":
-        model.to(device)
+    if hasattr(model.base_model.config, 'pad_token_id'):
+        model.base_model.config.pad_token_id = tokenizer.pad_token_id
     
     return model, tokenizer, device
 
@@ -132,10 +171,11 @@ def setup_lora_reward(model, device):
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        task_type="SEQ_CLS",  # Sequence classification for reward model
+        task_type="CAUSAL_LM",  # Still causal LM since we're using the base model
     )
 
-    model = get_peft_model(model, lora_config)
+    # Apply LoRA only to the base model, not the reward head
+    model.base_model = get_peft_model(model.base_model, lora_config)
     
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_params = sum(p.numel() for p in model.parameters())
@@ -252,7 +292,7 @@ def reward_loss(chosen_rewards, rejected_rewards):
     """Compute ranking loss for reward model."""
     return -torch.log(torch.sigmoid(chosen_rewards - rejected_rewards)).mean()
 
-def train_reward_model(model, train_dataloader, eval_dataloader, device):
+def train_reward_model(model, train_dataloader, eval_dataloader, device, tokenizer):
     """Train the reward model."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     
@@ -318,14 +358,38 @@ def train_reward_model(model, train_dataloader, eval_dataloader, device):
                 
                 if global_step % SAVE_EVERY_N_STEPS == 0:
                     checkpoint_path = os.path.join(OUTPUT_DIR, f"checkpoint-{global_step}")
-                    model.save_pretrained(checkpoint_path)
+                    os.makedirs(checkpoint_path, exist_ok=True)
+                    
+                    # Save the custom reward model
+                    torch.save(model.state_dict(), os.path.join(checkpoint_path, "reward_model.pt"))
+                    # Save tokenizer for convenience
+                    tokenizer.save_pretrained(checkpoint_path)
+                    
                     logger.info(f"Reward model checkpoint saved: {checkpoint_path}")
                 
                 accumulated_loss = 0
     
     # Final save
     final_path = os.path.join(OUTPUT_DIR, "final_reward_model")
-    model.save_pretrained(final_path)
+    os.makedirs(final_path, exist_ok=True)
+    
+    # Save the custom reward model state dict
+    torch.save(model.state_dict(), os.path.join(final_path, "reward_model.pt"))
+    
+    # Save tokenizer
+    tokenizer.save_pretrained(final_path)
+    
+    # Save model config for later loading
+    import json
+    config = {
+        "model_type": "custom_reward_model",
+        "base_model_path": SFT_MODEL_PATH if USE_SFT_MODEL else BASE_MODEL_NAME,
+        "hidden_size": model.base_model.config.hidden_size,
+        "use_sft_model": USE_SFT_MODEL
+    }
+    with open(os.path.join(final_path, "reward_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+    
     logger.info(f"Final reward model saved: {final_path}")
     
     return model
@@ -352,7 +416,7 @@ def main():
     eval_dataloader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=data_collator)
     
     # Train
-    model = train_reward_model(model, train_dataloader, eval_dataloader, device)
+    model = train_reward_model(model, train_dataloader, eval_dataloader, device, tokenizer)
     
     logger.info("✅ Reward model training completed!")
     logger.info(f"🎯 Reward model saved in: {OUTPUT_DIR}")

@@ -7,11 +7,13 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import torch.nn as nn
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
 import wandb
 import logging
+import json
 
 # =============================================================================
 # CONFIGURATION
@@ -58,6 +60,46 @@ PPO_CONFIG = PPOConfig(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class RewardModel(nn.Module):
+    """Custom reward model that adds a regression head to a causal LM."""
+    
+    def __init__(self, base_model_path):
+        super().__init__()
+        self.base_model = AutoModelForCausalLM.from_pretrained(base_model_path, trust_remote_code=True)
+        
+        # Add reward head
+        hidden_size = self.base_model.config.hidden_size
+        self.reward_head = nn.Linear(hidden_size, 1)
+        
+        # Initialize reward head
+        nn.init.zeros_(self.reward_head.weight)
+        nn.init.zeros_(self.reward_head.bias)
+    
+    def forward(self, input_ids, attention_mask=None):
+        # Get base model outputs
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        
+        # Get last hidden state
+        last_hidden_state = outputs.hidden_states[-1]
+        
+        # Use last non-padded token for each sequence
+        if attention_mask is not None:
+            sequence_lengths = attention_mask.sum(dim=1) - 1
+            batch_size = last_hidden_state.shape[0]
+            last_token_hidden = last_hidden_state[range(batch_size), sequence_lengths]
+        else:
+            last_token_hidden = last_hidden_state[:, -1]
+        
+        # Apply reward head
+        reward = self.reward_head(last_token_hidden)
+        
+        # Return in format expected by training loop
+        return type('RewardOutput', (), {'logits': reward})()
+
 def setup_wandb():
     """Initialize wandb for PPO training."""
     if not USE_WANDB:
@@ -87,13 +129,26 @@ def load_models():
     model = AutoModelForCausalLMWithValueHead.from_pretrained(SFT_MODEL_PATH)
     tokenizer = AutoTokenizer.from_pretrained(SFT_MODEL_PATH)
     
-    # Load reward model (it's a sequence classification model, not causal LM)
+    # Load custom reward model
     logger.info(f"Loading reward model from: {REWARD_MODEL_PATH}")
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        REWARD_MODEL_PATH,
-        num_labels=1,  # Single regression output
-        trust_remote_code=True
+    
+    # Load the reward model config to get base model path
+    config_path = os.path.join(REWARD_MODEL_PATH, "reward_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            reward_config = json.load(f)
+        base_model_path = reward_config.get("base_model_path", SFT_MODEL_PATH)
+    else:
+        logger.warning("No reward config found, using SFT model path as base")
+        base_model_path = SFT_MODEL_PATH
+    
+    # Create reward model and load weights
+    reward_model = RewardModel(base_model_path)
+    reward_state_dict = torch.load(
+        os.path.join(REWARD_MODEL_PATH, "reward_model.pt"),
+        map_location="cpu"
     )
+    reward_model.load_state_dict(reward_state_dict)
     
     # Move reward model to same device as main model
     if torch.cuda.is_available():
@@ -162,49 +217,100 @@ def compute_reward(reward_model, query_tensors, response_tensors, tokenizer):
     system_prompt = "You are a helpful assistant that summarizes text with the same voice as the author."
     
     for query, response in zip(query_tensors, response_tensors):
-        # Decode the generated response
-        response_text = tokenizer.decode(response, skip_special_tokens=True)
-        
-        # Decode the original query to extract the prompt
-        query_text = tokenizer.decode(query, skip_special_tokens=True)
-        
-        # Extract just the post content from the query
-        # This is a bit hacky but necessary to reconstruct the original format
-        if "Summarize the following post:" in query_text:
-            post_content = query_text.split("Summarize the following post:\n")[1].split("\n")[0]
-        else:
-            post_content = query_text  # Fallback
-        
-        # Create the full chat format that reward model expects
-        full_chat = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Summarize the following post:\n{post_content}"},
-            {"role": "assistant", "content": response_text}
-        ]
-        
-        # Format with chat template (same as reward model training)
-        full_text = tokenizer.apply_chat_template(full_chat, tokenize=False)
-        
-        # Tokenize for reward model
-        inputs = tokenizer(
-            full_text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=MAX_LENGTH,
-            padding=True
-        )
-        
-        # Move to same device as reward model
-        inputs = {k: v.to(reward_model.device) for k, v in inputs.items()}
-        
-        # Get reward score
-        with torch.no_grad():
-            outputs = reward_model(**inputs)
-            reward = outputs.logits.squeeze().cpu().item()
-        
-        rewards.append(reward)
+        try:
+            # Decode the generated response
+            response_text = tokenizer.decode(response, skip_special_tokens=True)
+            
+            # Decode the original query to extract the prompt
+            query_text = tokenizer.decode(query, skip_special_tokens=True)
+            
+            # Extract just the post content from the query
+            # This is a bit hacky but necessary to reconstruct the original format
+            if "Summarize the following post:" in query_text:
+                post_content = query_text.split("Summarize the following post:\n")[1].split("\n")[0]
+            else:
+                post_content = query_text  # Fallback
+            
+            # Create the full chat format that reward model expects
+            full_chat = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Summarize the following post:\n{post_content}"},
+                {"role": "assistant", "content": response_text}
+            ]
+            
+            # Format with chat template (same as reward model training)
+            full_text = tokenizer.apply_chat_template(full_chat, tokenize=False)
+            
+            # Tokenize for reward model
+            inputs = tokenizer(
+                full_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_LENGTH,
+                padding=True
+            )
+            
+            # Move to same device as reward model
+            inputs = {k: v.to(reward_model.device) for k, v in inputs.items()}
+            
+            # Get reward score
+            with torch.no_grad():
+                outputs = reward_model(**inputs)
+                reward = outputs.logits.squeeze().cpu().item()
+            
+            rewards.append(reward)
+            
+        except Exception as e:
+            logger.warning(f"Error computing reward: {e}, using default reward of 0.0")
+            rewards.append(0.0)
     
     return torch.tensor(rewards)
+
+def test_final_model(model_path, tokenizer_path, test_prompt="Write a short post about the benefits of exercise"):
+    """Test the final PPO model with a sample prompt."""
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        logger.info(f"Testing final model from: {model_path}")
+        
+        # Load the final model
+        model = AutoModelForCausalLM.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        
+        # Create test prompt in same format as training
+        system_prompt = "You are a helpful assistant that summarizes text with the same voice as the author."
+        chat = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Summarize the following post:\n{test_prompt}"},
+        ]
+        
+        prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(prompt, return_tensors="pt")
+        
+        # Generate summary
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                do_sample=True,
+                top_p=0.95,
+                temperature=0.7,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode response
+        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        generated_summary = full_response[len(prompt):].strip()
+        
+        logger.info("🧪 Model Test Results:")
+        logger.info(f"Prompt: {test_prompt}")
+        logger.info(f"Generated Summary: {generated_summary}")
+        
+        return generated_summary
+        
+    except Exception as e:
+        logger.error(f"Failed to test model: {e}")
+        return None
 
 def main():
     logger.info("🚀 Starting PPO training...")
@@ -289,8 +395,25 @@ def main():
         # Save checkpoint
         if epoch % 100 == 0 and epoch > 0:
             checkpoint_path = f"{OUTPUT_DIR}/checkpoint-{epoch}"
+            os.makedirs(checkpoint_path, exist_ok=True)
+            
+            # Save PPO model
             ppo_trainer.save_pretrained(checkpoint_path)
             tokenizer.save_pretrained(checkpoint_path)
+            
+            # Save checkpoint metadata
+            checkpoint_info = {
+                "epoch": epoch,
+                "total_steps": total_steps,
+                "reward_mean": rewards.mean().item(),
+                "reward_std": rewards.std().item(),
+                "model_type": "ppo_checkpoint",
+                "base_sft_model": SFT_MODEL_PATH,
+                "reward_model": REWARD_MODEL_PATH,
+            }
+            with open(os.path.join(checkpoint_path, "checkpoint_info.json"), "w") as f:
+                json.dump(checkpoint_info, f, indent=2)
+                
             logger.info(f"Checkpoint saved: {checkpoint_path}")
         
         # Stop after reasonable number of steps
@@ -298,16 +421,92 @@ def main():
             logger.info(f"Stopping after {total_steps} steps")
             break
     
-    # Final save
+    # Final save with comprehensive metadata
+    logger.info("Saving final PPO model...")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Save the PPO model
     ppo_trainer.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
+    
+    # Save comprehensive training info
+    final_info = {
+        "model_type": "ppo_final",
+        "base_sft_model": SFT_MODEL_PATH,
+        "reward_model": REWARD_MODEL_PATH,
+        "total_epochs": epoch,
+        "total_steps": total_steps,
+        "final_reward_mean": rewards.mean().item(),
+        "final_reward_std": rewards.std().item(),
+        "training_config": {
+            "learning_rate": PPO_CONFIG.learning_rate,
+            "batch_size": PPO_CONFIG.batch_size,
+            "mini_batch_size": PPO_CONFIG.mini_batch_size,
+            "ppo_epochs": PPO_CONFIG.ppo_epochs,
+            "target_kl": PPO_CONFIG.target_kl,
+            "cliprange": PPO_CONFIG.cliprange,
+        },
+        "data_splits": {
+            "sft_samples": f"0-{SFT_TRAIN_SIZE-1}",
+            "reward_samples": f"{SFT_TRAIN_SIZE}-{SFT_TRAIN_SIZE+REWARD_TRAIN_SIZE-1}",
+            "ppo_samples": f"{SFT_TRAIN_SIZE+REWARD_TRAIN_SIZE}-{SFT_TRAIN_SIZE+REWARD_TRAIN_SIZE+PPO_TRAIN_SUBSET-1}",
+        }
+    }
+    
+    with open(os.path.join(OUTPUT_DIR, "training_info.json"), "w") as f:
+        json.dump(final_info, f, indent=2)
+    
+    # Create a simple README for the final model
+    readme_content = f"""# RLHF-Trained Qwen Model
+
+This model has been trained using the full RLHF pipeline:
+
+1. **Supervised Fine-Tuning (SFT)**: Base model fine-tuned on chosen summaries
+2. **Reward Model Training**: Learned to prefer chosen over rejected summaries  
+3. **PPO Training**: Reinforcement learning using the reward model
+
+## Model Details
+- Base Model: {SFT_MODEL_PATH}
+- Reward Model: {REWARD_MODEL_PATH}
+- Final PPO Model: {OUTPUT_DIR}
+
+## Training Stats
+- Total Training Steps: {total_steps}
+- Final Reward Mean: {rewards.mean().item():.3f}
+- Final Reward Std: {rewards.std().item():.3f}
+
+## Usage
+Load the model using:
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("{OUTPUT_DIR}")
+tokenizer = AutoTokenizer.from_pretrained("{OUTPUT_DIR}")
+```
+
+This model should generate high-quality TLDR-style summaries!
+"""
+    
+    with open(os.path.join(OUTPUT_DIR, "README.md"), "w") as f:
+        f.write(readme_content)
+    
     logger.info(f"Final PPO model saved: {OUTPUT_DIR}")
+    logger.info(f"📄 Training info saved: {OUTPUT_DIR}/training_info.json")
+    logger.info(f"📖 README created: {OUTPUT_DIR}/README.md")
     
     if USE_WANDB:
         wandb.finish()
     
     logger.info("✅ PPO training completed!")
     logger.info("🎯 Your model should now generate better TLDR-style summaries!")
+    
+    # Test the final model
+    logger.info("🧪 Testing final model...")
+    test_result = test_final_model(OUTPUT_DIR, OUTPUT_DIR)
+    if test_result:
+        logger.info("✅ Model test completed successfully!")
+    else:
+        logger.warning("⚠️ Model test failed, but model should still be saved correctly")
 
 if __name__ == "__main__":
     main()
